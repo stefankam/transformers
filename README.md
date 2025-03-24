@@ -119,6 +119,8 @@ Install Dependencies: Ensure that you have the required libraries installed, suc
 pip install torch transformers
 ``` 
 
+If you choose to test the model t5\_dynamic with linkedin data, you could  use the file model\_test\_linkedin\_concurrent.py, where
+
 Model Initialization: Initialize the model and tokenizer from the pre-trained T5 model:
 
 ``` 
@@ -149,6 +151,29 @@ for new_comment in review_comments:
     print(f"Generated response: {response}")
 ``` 
 
+There are the following changes in terms of concurrency with respect to model\_test\_linkedin.py,
 
+```
+Concurrency with Threads:
 
+- comment_thread: Simulates the arrival of comments by calling update_encoder.
+
+- response_thread: Continuously generates responses using generate_response.
+
+Encoder Update with Locks:
+
+- encoder_lock: Prevents race conditions when reading or updating encoder_outputs.
+
+- encoder_updated: A flag that signals when the decoder should fetch new encoder outputs.
+
+Efficient Update Check:
+
+- Compares the last encoder output with the new one using L1 norm.
+
+- Updates only if the difference is greater than a small threshold (e.g., 0.01).
+
+Real-time Response Generation:
+
+- Decoder attends to updated encoder outputs in real-time when flagged as updated.
+```
 
