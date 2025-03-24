@@ -386,6 +386,7 @@ class T5Attention(nn.Module):
             self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads)
         self.pruned_heads = set()
         self.gradient_checkpointing = False
+        self.encoder_change_threshold = 1e-3
 
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -506,15 +507,25 @@ class T5Attention(nn.Module):
                 curr_past_key_value = past_key_value.self_attention_cache
 
         current_states = key_value_states if is_cross_attention else hidden_states
-        if is_cross_attention and past_key_value is not None and is_updated:
-            # reuse k,v, cross_attentions
-            key_states = curr_past_key_value.key_cache[self.layer_idx]
-            value_states = curr_past_key_value.value_cache[self.layer_idx]
-        else:
-            key_states = self.k(current_states)
-            value_states = self.v(current_states)
-            key_states = key_states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
-            value_states = value_states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
+        if is_cross_attention and past_key_value is not None:
+            # Check if encoder output has changed significantly
+            encoder_changed = False
+            if hasattr(past_key_value, "prev_encoder_kv"):
+               diff = (past_key_value.prev_encoder_kv - key_value_states).abs().mean()
+               encoder_changed = diff > self.encoder_change_threshold  # Define a threshold
+
+            if is_updated and not self.encoder_has_changed:  # Only reuse cache if encoder is unchanged
+                key_states = curr_past_key_value.key_cache[self.layer_idx]
+                value_states = curr_past_key_value.value_cache[self.layer_idx]
+            else:
+                key_states = self.k(key_value_states)
+                value_states = self.v(key_value_states)
+                key_states = key_states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
+                value_states = value_states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
+
+                # Update KV cache since encoder changed
+                past_key_value.prev_encoder_kv = key_value_states.detach()  # Store last encoder output
+                past_key_value.is_updated[self.layer_idx] = True
 
             if past_key_value is not None:
                 # save all key/value_states to cache to be re-used for fast auto-regressive generation
@@ -1781,6 +1792,9 @@ class T5ForConditionalGeneration(T5PreTrainedModel, GenerationMixin):
         self.model_parallel = False
         self.device_map = None
 
+        self.past_encoder_hidden_states = None  # Store previous encoder states
+        self.update_threshold = 0.10  # Threshold for detecting significant change
+
     @add_start_docstrings(PARALLELIZE_DOCSTRING)
     def parallelize(self, device_map=None):
         warnings.warn(
@@ -1881,6 +1895,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel, GenerationMixin):
 
         Examples:
 
+
         ```python
         >>> from transformers import AutoTokenizer, T5ForConditionalGeneration
 
@@ -1914,16 +1929,22 @@ class T5ForConditionalGeneration(T5PreTrainedModel, GenerationMixin):
         # Encode if needed (training, first prediction pass)
         if encoder_outputs is None:
             # Convert encoder inputs in embeddings if needed
-            encoder_outputs = self.encoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                inputs_embeds=inputs_embeds,
-                head_mask=head_mask,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-        
+            if encoder_outputs is None:
+                new_encoder_outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+                new_encoder_hidden_states = new_encoder_outputs[0]
+
+                # Compute difference between old and new encoder outputs
+                if self.past_encoder_hidden_states is not None:
+                      diff = torch.norm(new_encoder_hidden_states - self.past_encoder_hidden_states, dim=-1).mean()
+                      if diff > self.update_threshold:  # Threshold to determine significant change
+                          self.past_encoder_hidden_states = new_encoder_hidden_states
+                          encoder_hidden_states = new_encoder_hidden_states
+                      else:
+                          encoder_hidden_states = self.past_encoder_hidden_states  # Keep previous states
+                else:
+                      self.past_encoder_hidden_states = new_encoder_hidden_states
+                      encoder_hidden_states = new_encoder_hidden_states
+       
 
         elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
             encoder_outputs = BaseModelOutput(
@@ -1953,17 +1974,17 @@ class T5ForConditionalGeneration(T5PreTrainedModel, GenerationMixin):
                 decoder_attention_mask = decoder_attention_mask.to(self.decoder.first_device)
 
         # If new tokens are passed, update the encoder output with new context
-        if decoder_input_ids is not None:
+#        if decoder_input_ids is not None:
             # Recompute encoder outputs with new tokens (or context)
-            new_encoder_outputs = self.encoder(
-                input_ids=decoder_input_ids,
-                attention_mask=decoder_attention_mask,
+#            new_encoder_outputs = self.encoder(
+#                input_ids=decoder_input_ids,
+#                attention_mask=decoder_attention_mask,
                 # Other necessary parameters...
-            )
-            updated_hidden_states = new_encoder_outputs[0]
+ #           )
+#            updated_hidden_states = new_encoder_outputs[0]
             
             # Combine the previous and new encoder outputs (concatenate)
-            hidden_states = torch.cat([hidden_states, updated_hidden_states], dim=1)
+#            hidden_states = torch.cat([hidden_states, updated_hidden_states], dim=1)
 
         # Decode
         decoder_outputs = self.decoder(
